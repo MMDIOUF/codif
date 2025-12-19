@@ -1,0 +1,2114 @@
+﻿import io
+import re
+import unicodedata
+import hashlib
+import html
+from typing import List, Tuple, Dict, Any, Optional
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.preprocessing import normalize
+try:
+    import spacy
+except Exception:
+    spacy = None
+from collections import defaultdict
+import copy
+
+np.random.seed(42)
+
+# Imports sklearn uniquement si nécessaire (lazy loading)
+ENGLISH_STOP_WORDS = set()  # Sera chargé si besoin
+
+# ============================================================================
+# OPTIMISATIONS DE PERFORMANCE
+# ============================================================================
+# 1. @lru_cache sur fonctions utilitaires (_strip_accents, _normalize_label)
+# 2. @st.cache_data sur fonctions coûteuses (lecture Excel, parsing, export)
+# 3. Cache de dictionnaires validés (évite re-validation)
+# 4. Fonction _filter_non_empty_rows cachée pour filtrage rapide
+# 5. Initialisation optimisée des états de session
+# 6. Lazy loading des imports sklearn (non utilisés actuellement)
+# ============================================================================
+
+# Configuration de la page avec design moderne
+st.set_page_config(
+    page_title="Codification Assistée",
+    layout="wide", 
+    initial_sidebar_state="expanded",
+    page_icon="🎯"
+)
+
+# CSS design amélioré — lisibilité et boutons
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    :root{
+        --primary:#007AFF; --secondary:#5856D6; --bg:#FAFAFA; --card:#FFFFFF; --text:#111111; --muted:#666666; --border:#E6E6EA;
+    }
+    *{font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+    .main .block-container{padding:1.5rem;max-width:1300px;background:var(--bg)}
+    h1{color:var(--text);font-size:1.8rem;margin:0 0 .25rem 0}
+    .hero-card{background:linear-gradient(90deg,var(--primary),var(--secondary));color:#fff;padding:1rem;border-radius:12px;margin-bottom:1rem}
+    .modern-card{background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;border:1px solid var(--border);box-shadow:0 6px 18px rgba(16,24,40,0.04)}
+    .question-banner{background:#fff;border-left:6px solid var(--primary);padding:.75rem;border-radius:8px;margin-bottom:1rem}
+    .stButton>button{background:var(--primary);color:#fff;border-radius:8px;padding:.5rem .9rem;border:none;box-shadow:0 6px 18px rgba(16,24,40,.06)}
+    .stButton>button[aria-pressed="true"]{box-shadow:0 8px 30px rgba(0,122,255,.18)}
+    .stButton>button:hover{transform:translateY(-2px)}
+    .stTextArea textarea,.stTextInput input{border:1px solid var(--border);border-radius:8px;padding:.5rem;font-size:.95rem}
+    [data-testid="stFileUploader"]{border:2px dashed var(--primary);background:linear-gradient(180deg,rgba(0,122,255,0.02),transparent);padding:2rem;border-radius:12px}
+    [data-testid="stFileUploader"] section::before{content:"📂 Chargement des données";display:block;font-weight:700;color:var(--text);font-size:1.05rem}
+    [data-testid="stFileUploader"] section::after{content:"👇 Glissez-déposez vos fichiers Excel ou cliquez pour les sélectionner";display:block;color:var(--muted);margin-top:.25rem}
+    [data-testid="stFileUploader"] *{color:inherit!important}
+    .stDataFrame{border-radius:10px}
+    @media (max-width:768px){.main .block-container{padding:1rem}}
+</style>
+""", unsafe_allow_html=True)
+
+# Fonctions utilitaires avec caching
+@lru_cache(maxsize=1024)
+def _strip_accents(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s) if s is not None else ""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s
+
+@lru_cache(maxsize=512)
+def _normalize_label(s: str) -> str:
+    s = _strip_accents(s).lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s.upper()
+
+_Q_STARTERS = (
+    "pourquoi", "pouvez-vous", "pouvez vous", "quelles", "quels", "quelle", "quel", "que ", "qu'", "qu'",
+    "comment", "dans quelle", "dans quels", "dans quelles", "dans quel", "qu'est-ce", "qu est ce"
+)
+
+def _is_question_like(s: str) -> bool:
+    if not s:
+        return False
+    t = _strip_accents(str(s)).lower().strip()
+    if len(t) < 12:
+        return False
+    if any(t.startswith(p) for p in _Q_STARTERS):
+        return True
+    if t.endswith('?') and len(t.split()) >= 3:
+        return True
+    return False
+
+@st.cache_data(show_spinner=False)
+def read_sheet_question(xls_bytes: bytes, sheet_name: str) -> str:
+    """Lecture de la question avec cache pour éviter les lectures répétées"""
+    try:
+        wb = load_workbook(io.BytesIO(xls_bytes), read_only=True, data_only=True)
+        if sheet_name not in wb.sheetnames:
+            return ""
+        ws = wb[sheet_name]
+        candidates = []
+        for r in range(1, 16):
+            for c in range(1, 21):
+                v = ws.cell(row=r, column=c).value
+                if isinstance(v, str) and len(v.strip()) >= 8:
+                    candidates.append(v.strip())
+        wb.close()
+        for v in candidates:
+            if _is_question_like(v):
+                return v
+        if candidates:
+            return max(candidates, key=lambda x: len(x))
+    except Exception:
+        pass
+    return ""
+
+_FR_STOP = {
+    "le","la","les","un","une","des","de","du","au","aux","ce","cet","cette","ces","mais","ou","et","donc","or","ni","car","je","tu","il","elle","on","nous","vous","ils","elles","ne","pas","plus","moins","tres","très","comme","pour","par","avec","sans","sous","sur","entre","dans","chez","vers","ete","ete","etre","être","fait","faites","faire","a","à","de","d","l","qu","que","qui","quoi","ou","où","mon","ma","mes","ton","ta","tes","son","sa","ses","leur","leurs","c","ca","ça","cela","ceci","y","en","aujourd","hui","auxquels","auxquelles","dont","des","du","dun","dune","ainsi","afin","avant","apres","après","depuis","pendant","lors","leurs","leurs","toutes","tous","tout","toute","trop","peu","beaucoup","assez","tel","telle","tels","telles","si","sont","est","suis","sommes","etes","êtes","etez","etes","serai","sera","seront","serait","seraient","fut","furent","ete","etes","avait","avaient","avoir","avait","avez","ont","ont","bien","mal","tres","trop","assez",
+}
+_STOPWORDS = set(ENGLISH_STOP_WORDS) | _FR_STOP
+
+def _basic_clean_text(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"\S+@\S+", " ", s)
+    s = _strip_accents(s).lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def detect_columns(df: pd.DataFrame) -> Tuple[str, str]:
+    cols = list(df.columns)
+    scores_id = {c: 0.0 for c in cols}
+    scores_txt = {c: 0.0 for c in cols}
+    for c in cols:
+        raw_name = str(c)
+        cn = _normalize_label(raw_name)
+        raw_lower = raw_name.lower()
+        if re.search(r"(^|_)id($|_)|(^|_)ident|(^|_)m_id|(^|_)caseid|(^|_)respond|(^|_)numero|(^|_)num($|_)|(^|_)no($|_)", cn):
+            scores_id[c] += 3.0
+        if re.search(r"verbat|comment|texte|text|libell|reponse|reponses|reponse_ouverte|motif|description|detail|retour|avis", cn):
+            scores_txt[c] += 3.0
+        if re.search(r"^code[\s_]*\d+", raw_lower):
+            scores_txt[c] -= 5.0
+        if raw_lower.startswith("unnamed"):
+            scores_txt[c] -= 1.0
+        s = df[c]
+        nunique = s.nunique(dropna=True)
+        frac_unique = nunique / max(1, len(s))
+        if frac_unique > 0.7:
+            scores_id[c] += 1.0
+        if s.dtype == object:
+            try:
+                lens = s.astype(str).str.len()
+                mean_len = lens.replace({np.nan: 0}).mean()
+            except Exception:
+                mean_len = 0
+            scores_txt[c] += min(mean_len / 40.0, 3.0)
+        else:
+            scores_id[c] += 0.5
+        if s.notna().sum() <= max(1, len(s) * 0.05):
+            scores_id[c] -= 0.5
+            scores_txt[c] -= 0.5
+    id_col = max(scores_id, key=lambda k: scores_id[k]) if cols else None
+    txt_col = max(scores_txt, key=lambda k: scores_txt[k]) if cols else None
+    if id_col is None and cols:
+        id_col = cols[0]
+    if txt_col is None and len(cols) > 1:
+        cand = [c for c in cols if c != id_col]
+        txt_col = cand[0] if cand else cols[0]
+    if id_col is None:
+        # Do NOT create new columns or modify the original DataFrame structure.
+        # If no clear id column detected, fallback to the first column name when available.
+        id_col = cols[0] if cols else None
+    return id_col, txt_col
+
+@st.cache_data(show_spinner=False)
+def parse_text_dictionary(text: str) -> pd.DataFrame:
+    """Parse un dictionnaire avec cache pour éviter les re-calculs.
+
+    Le parseur principal tente plusieurs heuristiques ; si rien n'est trouvé,
+    un parseur plus tolérant est utilisé en fallback (tabs, multiples séparateurs,
+    définitions contenant des chiffres, etc.).
+    """
+    def _split_def_ids(rest: str) -> Tuple[str, str]:
+        rest = rest.strip()
+        m = re.search(r"^(.*?)(\d[\d\s,;]*)$", rest)
+        if m:
+            candidate_def = m.group(1).rstrip(",; -")
+            candidate_ids = m.group(2).strip()
+            tokens = [t for t in re.split(r"[;,\s]+", candidate_ids) if t.strip()]
+            digit_tokens = [t for t in tokens if t.isdigit()]
+            if tokens and digit_tokens and len(digit_tokens) / len(tokens) >= 0.6:
+                return candidate_def.strip(), candidate_ids.strip()
+        candidates = ["|", "=>", " - ", " : ", ":", ";"]
+        for sep in candidates:
+            if sep in rest:
+                left, right = rest.rsplit(sep, 1)
+                if any(ch.isdigit() for ch in right):
+                    return left.strip(), right.strip()
+        return rest.strip(), ""
+
+    def _lenient_parse(text: str) -> pd.DataFrame:
+        # parser tolérant: accepte tabs, multiples espaces, NBSP, et extrait la fin numérique
+        rows: List[Dict[str, Any]] = []
+        for raw in text.splitlines():
+            if not raw or not raw.strip():
+                continue
+            line = raw.replace('\u00A0', ' ').replace('，', ',').replace('\t', ' ').strip()
+            # attempt: code at start
+            m = re.match(r"^\s*(\d+)\s+[\-:\|]?\s*(.*)$", line)
+            if m:
+                code = m.group(1)
+                rest = m.group(2).strip()
+            else:
+                parts = re.split(r"\t|\s{2,}|\s-\s|\s\|\s", raw)
+                if parts and re.match(r"^\d+$", parts[0].strip()):
+                    code = parts[0].strip()
+                    rest = parts[1].strip() if len(parts) > 1 else ''
+                else:
+                    # nothing recognized
+                    continue
+
+            ids = []
+            ids_candidate = ''
+            # prefer explicit trailing tab part
+            if '\t' in raw:
+                tail = raw.split('\t')[-1]
+                if re.search(r'\d', tail):
+                    ids_candidate = tail
+            if not ids_candidate:
+                m2 = re.search(r'([0-9][0-9,;\s]*)$', rest)
+                if m2:
+                    ids_candidate = m2.group(1).strip()
+                    rest = rest[:m2.start()].strip()
+            if ids_candidate:
+                tokens = re.split(r'[;,\s]+', ids_candidate)
+                ids = []
+                for tok in (t.strip() for t in tokens):
+                    if tok.isdigit():
+                        try:
+                            ids.append(int(tok))
+                        except Exception:
+                            ids.append(tok)
+            rows.append({'code': code, 'definition': rest, 'ids': ids})
+        return pd.DataFrame(rows)
+
+    # Prefer the lenient parser first (plus tolérant sur tabs / séparateurs)
+    try:
+        lenient_out = _lenient_parse(text)
+        if not lenient_out.empty:
+            return lenient_out
+    except Exception:
+        pass
+
+    # main parse attempt (original logic)
+    lines = [l.rstrip() for l in text.split("\n") if l.strip()]
+    rows: List[Dict[str, Any]] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if "code" in low and ("theme" in low or "thème" in low or "definition" in low or "définition" in low):
+            continue
+        m = re.match(r"^\s*(\d+)\s*(.*)$", line)
+        if not m:
+            continue
+        code = m.group(1)
+        rest = m.group(2).strip()
+        rest = re.sub(r"^[\-\|:,;>]+", "", rest).strip()
+        definition, ids_str = _split_def_ids(rest)
+        ids: List[str] = []
+        if ids_str:
+            for token in re.split(r"[;,\s]+", ids_str):
+                tok = token.strip()
+                if tok.strip():
+                    ids.append(str(tok).strip())  # Toujours stocker comme string
+        rows.append({"code": code, "definition": definition, "ids": ids})
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        # fallback to lenient parser
+        try:
+            out = _lenient_parse(text)
+        except Exception:
+            out = pd.DataFrame(rows)
+    return out
+
+def assign_codes_from_dict_with_ids(
+    df: pd.DataFrame,
+    id_col: str,
+    codebook_with_ids: pd.DataFrame,
+    max_codes: int | None = None,
+) -> List[List[int]]:
+    if codebook_with_ids.empty or "code" not in codebook_with_ids.columns or "ids" not in codebook_with_ids.columns:
+        return [[pd.NA] for _ in range(len(df))]
+
+    id_to_codes: Dict[str, List[int]] = {}
+    for _, row in codebook_with_ids.iterrows():
+        try:
+            code_num = int(row["code"])
+        except Exception:
+            continue
+        ids_list = row["ids"] or []
+        for vid in ids_list:
+            vid_str = str(vid).strip()
+            if not vid_str:
+                continue
+            if vid_str not in id_to_codes:
+                id_to_codes[vid_str] = []
+            id_to_codes[vid_str].append(code_num)
+
+    if max_codes is None:
+        max_codes = 0
+        for codes in id_to_codes.values():
+            if isinstance(codes, list):
+                max_codes = max(max_codes, len(codes))
+        if max_codes <= 0:
+            max_codes = 1
+        # No arbitrary upper cap: allow as many codes as needed
+
+    assigned: List[List[int]] = []
+    for _, row in df.iterrows():
+        vid = str(row[id_col]).strip()
+        codes = list(dict.fromkeys(id_to_codes.get(vid, [])))
+        if len(codes) == 0:
+            codes = [pd.NA]
+        while len(codes) < max_codes:
+            codes.append(pd.NA)
+        assigned.append(codes[:max_codes])
+
+    return assigned
+
+def _clean_column_label(label: Any, idx: int) -> str:
+    if label is None or (isinstance(label, float) and pd.isna(label)):
+        return f"col_{idx + 1}"
+    lab = str(label).replace("\n", " ")
+    lab = re.sub(r"\s+", " ", lab).strip()
+    if not lab or lab.lower().startswith("unnamed"):
+        lab = f"col_{idx + 1}"
+    return lab
+
+def _make_unique_columns(cols: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    unique = []
+    for col in cols:
+        base = col or "col"
+        count = seen.get(base, 0)
+        if count:
+            new_name = f"{base}_{count + 1}"
+        else:
+            new_name = base
+        seen[base] = count + 1
+        unique.append(new_name)
+    return unique
+
+def _drop_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keep = []
+    for c in df.columns:
+        col = df[c]
+        if col.notna().any():
+            if col.dtype == object:
+                if col.astype(str).str.strip().str.len().gt(0).any():
+                    keep.append(c)
+            else:
+                keep.append(c)
+        else:
+            continue
+    if keep and len(keep) < len(df.columns):
+        return df[keep]
+    return df
+
+
+def display_dataframe_interactive(df: pd.DataFrame, key: str = "aggrid", height: int = 300, id_col: str = None, txt_col: str = None):
+    """Affiche un DataFrame avec AgGrid si disponible, sinon fallback sur st.dataframe.
+    
+    Args:
+        df: DataFrame à afficher
+        key: Clé unique pour le composant
+        height: Hauteur du tableau en pixels
+        id_col: Nom de la colonne d'identifiant (pour le nettoyage)
+        txt_col: Nom de la colonne de texte (pour le nettoyage)
+    """
+    def is_empty_or_whitespace(value):
+        """Vérifie si une valeur est vide, NA ou ne contient que des espaces."""
+        if pd.isna(value):
+            return True
+        if isinstance(value, (int, float)):
+            return False
+        return str(value).strip() == ""
+    
+    try:
+        # Vérification des entrées
+        if df is None or df.empty:
+            return st.warning("Aucune donnée à afficher")
+        
+        # Création d'une copie profonde pour éviter les effets de bord
+        df_clean = df.copy(deep=True)
+        
+        # Nettoyage initial du DataFrame
+        if id_col is not None and txt_col is not None:
+            # Vérifier que les colonnes existent
+            missing_cols = [col for col in [id_col, txt_col] if col not in df_clean.columns]
+            if missing_cols:
+                st.warning(f"Colonnes manquantes : {', '.join(missing_cols)}")
+            else:
+                # Nettoyage spécifique avec sanitize_table
+                df_clean = sanitize_table(df_clean, id_col, txt_col)
+        
+        # Suppression des lignes vides
+        if not df_clean.empty:
+            # Créer un masque pour les lignes non vides (au moins une colonne non vide)
+            non_empty_mask = ~df_clean.apply(
+                lambda row: all(is_empty_or_whitespace(x) for x in row),
+                axis=1
+            )
+            df_clean = df_clean[non_empty_mask].copy()
+        
+        # Vérification finale
+        if df_clean.empty:
+            return st.warning("Aucune donnée valide à afficher après le nettoyage")
+        
+        # Réinitialisation de l'index pour un affichage propre
+        df_clean = df_clean.reset_index(drop=True)
+        
+        # Essai d'affichage avec AgGrid
+        try:
+            from st_aggrid import AgGrid, GridOptionsBuilder
+            
+            gb = GridOptionsBuilder.from_dataframe(df_clean)
+            gb.configure_default_column(
+                editable=False,
+                filter=True,
+                sortable=True,
+                resizable=True,
+                min_column_width=100
+            )
+            
+            # Configuration spécifique pour les colonnes de code
+            code_columns = [col for col in df_clean.columns if str(col).lower().startswith('code')]
+            for col in code_columns:
+                gb.configure_column(col, width=120)
+            
+            gb.configure_side_bar()
+            grid_options = gb.build()
+            
+            return AgGrid(
+                df_clean,
+                gridOptions=grid_options,
+                enable_enterprise_modules=False,
+                height=min(600, max(300, height)),
+                width='100%',
+                key=key,
+                update_mode='NO_UPDATE',
+                fit_columns_on_grid_load=True,
+                allow_unsafe_jscode=True
+            )
+            
+        except ImportError:
+            # Fallback sur st.dataframe si AgGrid n'est pas disponible
+            st.warning("st_aggrid n'est pas disponible, utilisation de st.dataframe")
+            return st.dataframe(
+                df_clean,
+                height=height,
+                use_container_width=True,
+                hide_index=False,
+                column_order=df_clean.columns.tolist()
+            )
+            
+    except Exception as e:
+        st.error(f"Erreur lors de l'affichage du tableau: {str(e)}")
+        
+        # Dernier recours : affichage basique
+        if 'df_clean' in locals() and not df_clean.empty:
+            return st.dataframe(
+                df_clean,
+                height=height,
+                use_container_width=True
+            )
+        elif df is not None and not df.empty:
+            return st.dataframe(
+                df.head(100),  # Limiter à 100 lignes pour éviter les problèmes de performance
+                height=height,
+                use_container_width=True
+            )
+        else:
+            return st.error("Impossible d'afficher les données")
+
+
+def persist_dict_to_sqlite(df: pd.DataFrame, db_path: str = "dictionaries.db", table_name: str = "codebook") -> None:
+    """Sauvegarde un DataFrame (dictionnaire) dans une base SQLite. Usage optionnel pour très grands dictionnaires."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        # Ensure ids column is stored as text (JSON) for portability
+        if "ids" in df.columns:
+            df_to_store = df.copy()
+            df_to_store["ids"] = df_to_store["ids"].apply(lambda v: ",".join(str(x) for x in v) if isinstance(v, (list, tuple)) else (str(v) if pd.notna(v) else ""))
+        else:
+            df_to_store = df
+        df_to_store.to_sql(table_name, conn, if_exists="replace", index=False)
+        conn.close()
+    except Exception as e:
+        # Do not raise — helper is optional
+        st.warning(f"⚠️ Échec de la sauvegarde SQLite (optionnel): {e}")
+
+
+def validate_codebook_db(table_name: str, db_path: str, df_id_set: set) -> Dict[str, Any]:
+    """Valide un codebook stocké en SQLite sans charger l'ensemble en mémoire.
+
+    Retourne le même dict que `validate_codebook`.
+    """
+    res = {
+        "ids_not_found": [],
+        "duplicated_ids_between_themes": [],
+        "themes_without_ids": [],
+        "ids_covered": set(),
+    }
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(f"SELECT code, ids FROM {table_name}")
+        seen = {}
+        row_idx = 0
+        for row in cur:
+            row_idx += 1
+            code, ids_txt = row
+            if ids_txt is None or str(ids_txt).strip() == "":
+                try:
+                    res["themes_without_ids"].append(int(code))
+                except Exception:
+                    res["themes_without_ids"].append(code)
+                continue
+            # ids_txt expected as comma-separated
+            tokens = re.split(r"[;,\s]+", str(ids_txt))
+            for tok in tokens:
+                t = tok.strip()
+                if not t:
+                    continue
+                # unify as string for comparison
+                if t not in df_id_set:
+                    res["ids_not_found"].append(t)
+                res["ids_covered"].add(t)
+                seen[t] = seen.get(t, 0) + 1
+        res["duplicated_ids_between_themes"] = [k for k, v in seen.items() if v > 1]
+        conn.close()
+    except Exception as e:
+        st.warning(f"⚠️ Validation DB échouée: {e}")
+    return res
+
+
+def persist_mapping_table(codebook_df: pd.DataFrame, db_path: str = "dictionaries.db", mapping_table: str = "code_id_map") -> None:
+    """Crée une table `mapping_table` dans SQLite avec des lignes (id, code) pour faciliter les jointures sans charger tout en mémoire."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(f"DROP TABLE IF EXISTS {mapping_table}")
+        cur.execute(f"CREATE TABLE {mapping_table} (id TEXT, code INTEGER)")
+
+        # estimate total ids for progress
+        total_ids = 0
+        for _, row in codebook_df.iterrows():
+            ids_list = row.get("ids") or []
+            try:
+                total_ids += len(ids_list)
+            except Exception:
+                total_ids += len(re.split(r"[;,\s]+", str(ids_list)))
+
+        batch = []
+        inserted = 0
+        prog = None
+        try:
+            if total_ids > 0:
+                prog = st.progress(0)
+                st.info(f"Création du mapping SQLite: ~{total_ids} entrées")
+        except Exception:
+            prog = None
+
+        for _, row in codebook_df.iterrows():
+            try:
+                code_num = int(row["code"])
+            except Exception:
+                continue
+            ids_list = row.get("ids") or []
+            for vid in ids_list:
+                if vid is None:
+                    continue
+                vid_str = str(vid).strip()
+                if not vid_str:
+                    continue
+                batch.append((vid_str, code_num))
+                if len(batch) >= 2000:
+                    cur.executemany(f"INSERT INTO {mapping_table} (id, code) VALUES (?, ?)", batch)
+                    inserted += len(batch)
+                    batch = []
+                    if prog is not None and total_ids > 0:
+                        try:
+                            prog.progress(min(100, int(100 * inserted / max(1, total_ids))))
+                        except Exception:
+                            pass
+
+        if batch:
+            cur.executemany(f"INSERT INTO {mapping_table} (id, code) VALUES (?, ?)", batch)
+            inserted += len(batch)
+            if prog is not None and total_ids > 0:
+                try:
+                    prog.progress(min(100, int(100 * inserted / max(1, total_ids))))
+                except Exception:
+                    pass
+
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{mapping_table}_id ON {mapping_table} (id)")
+        conn.commit()
+        conn.close()
+        if prog is not None:
+            try:
+                prog.progress(100)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            st.warning(f"⚠️ Échec de la création du mapping SQLite (optionnel): {e}")
+        except Exception:
+            pass
+
+
+def assign_codes_from_db(df: pd.DataFrame, id_col: str, db_path: str = "dictionaries.db", mapping_table: str = "code_id_map", max_codes: int | None = None) -> List[List[int]]:
+    """Assigne des codes en interrogeant la table de mapping SQLite par lots pour éviter d'avoir tout en RAM.
+
+    Args:
+        df: DataFrame contenant les données
+        id_col: Nom de la colonne contenant les identifiants
+        db_path: Chemin vers la base de données SQLite
+        mapping_table: Nom de la table de mapping
+        max_codes: Nombre maximum de codes à retourner par ligne
+        
+    Returns:
+        Liste de listes de codes assignés
+    """
+    conn = None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # Récupérer les IDs uniques et nettoyés
+        unique_ids = list({str(x).strip() for x in df[id_col].astype(str).tolist() if str(x).strip()})
+        id_to_codes: Dict[str, List[int]] = {}
+        
+        # Traiter par lots pour les grands jeux de données
+        CHUNK = 1000
+        for i in range(0, len(unique_ids), CHUNK):
+            chunk = unique_ids[i : i + CHUNK]
+            placeholders = ",".join(["?" for _ in chunk])
+            query = f"SELECT id, code FROM {mapping_table} WHERE id IN ({placeholders})"
+            cur.execute(query, chunk)
+            
+            # Récupérer les correspondances ID -> codes
+            for row in cur.fetchall():
+                vid, code = row
+                vid_str = str(vid).strip()
+                if vid_str not in id_to_codes:
+                    id_to_codes[vid_str] = []
+                if code not in id_to_codes[vid_str]:
+                    id_to_codes[vid_str].append(code)
+
+        # Déterminer le nombre maximum de codes si non spécifié
+        if max_codes is None:
+            max_codes = 0
+            for codes in id_to_codes.values():
+                if isinstance(codes, list):
+                    max_codes = max(max_codes, len(codes))
+            max_codes = max(1, max_codes)  # Au moins 1 code par défaut
+
+        # Assigner les codes à chaque ligne du DataFrame
+        assigned: List[List[int]] = []
+        for _, row in df.iterrows():
+            vid = str(row[id_col]).strip()
+            codes = list(dict.fromkeys(id_to_codes.get(vid, [])))  # Éviter les doublons
+            
+            # Assurer qu'il y a au moins un code (même si c'est NA)
+            if not codes:
+                codes = [pd.NA]
+                
+            # Compléter avec des NA si nécessaire
+            while len(codes) < max_codes:
+                codes.append(pd.NA)
+                
+            assigned.append(codes[:max_codes])
+        
+        return assigned
+        
+    except Exception as e:
+        st.warning(f"⚠️ Erreur lors de l'assignation des codes depuis la base de données: {e}")
+        # Retourner une liste vide pour chaque ligne en cas d'erreur
+        return [[] for _ in range(len(df))]
+        
+    finally:
+        # Toujours fermer la connexion à la base de données
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def sanitize_table(df_tbl: pd.DataFrame, id_col_name: str, txt_col_name: str) -> pd.DataFrame:
+    """
+    Supprime les lignes vides ou contenant uniquement des espaces/NA/None.
+    """
+    if df_tbl is None or df_tbl.empty:
+        return pd.DataFrame()
+        
+    # Faire une copie pour éviter les modifications inattendues
+    df = df_tbl.copy()
+    
+    # Supprimer les lignes où toutes les valeurs sont NA
+    df = df.dropna(how='all')
+    
+    # Supprimer les lignes où toutes les valeurs sont des chaînes vides ou des espaces
+    mask = df.astype(str).apply(lambda x: x.str.strip() != '').any(axis=1)
+    df = df[mask].copy()
+    
+    return df
+
+def _guess_header_row(df_raw: pd.DataFrame) -> int:
+    """Tente de deviner la ligne d'en-tête en fonction des valeurs."""
+    # Heuristique simple: la ligne avec le plus de valeurs non vides est probablement l'en-tête
+    non_empty_counts = df_raw.notnull().sum(axis=1)
+    best_idx = non_empty_counts.idxmax()
+    best_score = non_empty_counts.max()
+    
+    # Si la première ligne est la meilleure, mais qu'il y a des lignes avec le même score, 
+    # vérifier si la première ligne contient plus de valeurs "ressemblant à des questions"
+    if best_idx == 0 and (non_empty_counts == best_score).sum() > 1:
+        text_like = 0
+        for x in df_raw.iloc[0]:
+            if isinstance(x, str) and _is_question_like(x.strip()):
+                text_like += 1
+        score = float(non_empty_counts.iloc[0]) + text_like * 0.5
+        if score > best_score:
+            best_score = score
+            best_idx = 0
+            
+    return best_idx
+
+def _read_sheet_with_header_detection(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
+    try:
+        df_raw = xls.parse(sheet_name=sheet_name, header=None, dtype=object)
+    except Exception:
+        df = xls.parse(sheet_name=sheet_name, dtype=object)
+        # Supprimer les lignes entièrement vides
+        return df.dropna(how='all').reset_index(drop=True)
+        
+    if df_raw.empty:
+        df = df_raw.copy()
+        df.columns = []
+        return df
+        
+    header_idx = _guess_header_row(df_raw)
+    header_values = df_raw.iloc[header_idx].tolist()
+    cleaned_cols = [_clean_column_label(col, idx) for idx, col in enumerate(header_values)]
+    unique_cols = _make_unique_columns(cleaned_cols)
+    
+    # Récupérer les données sous l'en-tête et supprimer les lignes entièrement vides
+    data = df_raw.iloc[header_idx + 1:].copy()
+    data.columns = unique_cols
+    
+    # Supprimer les lignes où toutes les valeurs sont vides (après avoir défini les colonnes)
+    data = data.dropna(how='all')
+    
+    return data
+
+def _extract_question_from_columns(columns: List[Any]) -> str:
+    candidates = []
+    for col in columns:
+        if isinstance(col, str):
+            text = col.strip()
+            if _is_question_like(text):
+                candidates.append(text)
+    if candidates:
+        return max(candidates, key=len)
+    return ""
+
+@st.cache_data(show_spinner=False)
+def _filter_non_empty_rows(df: pd.DataFrame, txt_col: str) -> pd.DataFrame:
+    """Filtre les lignes avec du texte non vide - avec cache
+    
+    Args:
+        df: DataFrame à filtrer
+        txt_col: Nom de la colonne de texte à vérifier
+        
+    Returns:
+        DataFrame filtré ne contenant que les lignes avec du texte non vide
+    """
+    if df is None or df.empty or txt_col not in df.columns:
+        return pd.DataFrame() if df is None else df.copy()
+        
+    # Créer une copie pour éviter les avertissements de modification sur vue
+    df = df.copy()
+    
+    # Remplacer les valeurs nulles par des chaînes vides et convertir en chaîne
+    s_txt = df[txt_col].fillna("").astype(str)
+    
+    # Créer un masque pour les lignes non vides
+    # - Vérifie que le texte n'est pas vide après suppression des espaces
+    # - Vérifie que le texte n'est pas "none", "nan", "null" (insensible à la casse)
+    mask = (
+        s_txt.str.strip().ne("") & 
+        ~s_txt.str.strip().str.lower().isin(["none", "nan", "null", ""])
+    )
+    
+    # Appliquer le masque et retourner une copie du résultat
+    return df.loc[mask].copy()
+
+@st.cache_data(show_spinner="Génération du dictionnaire automatique...")
+def suggest_dictionary_tfidf(
+    df: pd.DataFrame,
+    id_col: str,
+    txt_col: str,
+    n_clusters: Optional[int] = None,
+    max_features: int = 2000,
+) -> pd.DataFrame:
+    """Propose un dictionnaire automatique basé sur TF-IDF + KMeans.
+
+    Retourne un DataFrame avec colonnes: code (int), definition (str), ids (list[str]).
+    """
+    try:
+        texts = df[txt_col].fillna("").astype(str).map(_basic_clean_text)
+    except Exception:
+        return pd.DataFrame(columns=["code", "definition", "ids"])
+
+    if texts.empty or texts.str.strip().eq("").all():
+        return pd.DataFrame(columns=["code", "definition", "ids"])
+
+    # Heuristique pour le nombre de clusters si non fourni
+    n_rows = max(1, len(texts))
+    if n_clusters is None:
+        n_clusters = min(max(3, n_rows // 50), 25)
+
+    try:
+        vect = TfidfVectorizer(max_features=max_features, ngram_range=(1, 2), stop_words=list(_STOPWORDS))
+        X = vect.fit_transform(texts)
+    except Exception:
+        return pd.DataFrame(columns=["code", "definition", "ids"])
+
+    if X.shape[0] <= (n_clusters or 0):
+        n_clusters = max(1, X.shape[0] // 2)
+
+    # Use MiniBatchKMeans for performance on large datasets
+    try:
+        mb = MiniBatchKMeans(n_clusters=max(1, int(n_clusters)), random_state=42, batch_size=1024)
+        labels = mb.fit_predict(X)
+        km = mb
+    except Exception:
+        try:
+            km = KMeans(n_clusters=max(1, int(n_clusters)), random_state=42)
+            labels = km.fit_predict(X)
+        except Exception:
+            labels = [0] * X.shape[0]
+            km = None
+
+    feature_names = vect.get_feature_names_out() if hasattr(vect, "get_feature_names_out") else []
+
+    clusters: Dict[int, Dict[str, Any]] = {}
+    for i, lab in enumerate(labels):
+        clusters.setdefault(int(lab), {"idxs": [], "texts": []})
+        clusters[int(lab)]["idxs"].append(i)
+        clusters[int(lab)]["texts"].append(texts.iat[i])
+
+    rows: List[Dict[str, Any]] = []
+    # normalize sparse matrix for cosine computations
+    try:
+        X_norm = normalize(X)
+    except Exception:
+        X_norm = X
+    for cidx, info in clusters.items():
+        idxs = info["idxs"]
+        # centroid approximation
+        try:
+            centroid = X_norm[idxs].mean(axis=0)
+            if hasattr(centroid, "A1"):
+                centroid = np.asarray(centroid).ravel()
+        except Exception:
+            centroid = None
+
+        top_terms = []
+        try:
+            if centroid is not None and len(feature_names):
+                # centroid may be sparse; convert safely
+                cent_arr = np.asarray(centroid).ravel()
+                top_idx = np.argsort(-cent_arr)[:6]
+                top_terms = [feature_names[i] for i in top_idx if i < len(feature_names)]
+        except Exception:
+            top_terms = []
+
+        # representative verbatims: choose those closest to centroid
+        rep_verbatims: List[str] = []
+        try:
+            if centroid is not None:
+                cluster_X = X_norm[idxs]
+                sims = cosine_similarity(cluster_X, centroid.reshape(1, -1)).ravel()
+                top_idx_local = np.argsort(-sims)[:3]
+                rep_verbatims = [texts.iat[idxs[i]] for i in top_idx_local]
+        except Exception:
+            rep_verbatims = info["texts"][:3]
+
+        ids_list = [str(df[id_col].iat[i]) for i in idxs]
+        definition = " / ".join([t.replace(" ", " ") for t in (top_terms[:4] or rep_verbatims[:1])])
+        rows.append({"code": None, "definition": definition, "ids": ids_list, "verbatims_representatifs": rep_verbatims})
+
+    # Convert en DataFrame et numéroter
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["code"] = list(range(1, len(out) + 1))
+    return out[["code", "definition", "ids", "verbatims_representatifs"]]
+
+
+def suggest_dictionary_embeddings(
+    df: pd.DataFrame,
+    id_col: str,
+    txt_col: str,
+    model_name: str = "all-MiniLM-L6-v2",
+    min_cluster_size: int | None = None,
+) -> pd.DataFrame:
+    """Propose un dictionnaire automatique basé sur embeddings + HDBSCAN (ou KMeans fallback).
+
+    Retourne un DataFrame avec colonnes: code (int), definition (str), ids (list[str]).
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception:
+        return pd.DataFrame(columns=["code", "definition", "ids", "verbatims_representatifs"])
+
+    texts = df[txt_col].fillna("").astype(str).map(_basic_clean_text)
+    if texts.empty or texts.str.strip().eq("").all():
+        return pd.DataFrame(columns=["code", "definition", "ids", "verbatims_representatifs"])
+
+    if min_cluster_size is None:
+        min_cluster_size = max(3, len(texts) // 100)
+
+    try:
+        model = SentenceTransformer(model_name)
+        emb = model.encode(texts.tolist(), show_progress_bar=False)
+    except Exception:
+        return pd.DataFrame(columns=["code", "definition", "ids", "verbatims_representatifs"])
+
+    # clustering with hdbscan
+    try:
+        import hdbscan
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=max(2, int(min_cluster_size)), metric='euclidean', prediction_data=False)
+        labels = clusterer.fit_predict(np.array(emb))
+    except Exception:
+        # fallback to kmeans on embeddings
+        try:
+            km = MiniBatchKMeans(n_clusters=max(2, min(25, len(texts) // 50)), random_state=42, batch_size=1024)
+            labels = km.fit_predict(np.array(emb))
+        except Exception:
+            labels = np.array([0] * len(texts))
+
+    clusters: Dict[int, Dict[str, Any]] = {}
+    for i, lab in enumerate(labels):
+        lab = int(lab)
+        clusters.setdefault(lab, {"idxs": [], "texts": []})
+        clusters[lab]["idxs"].append(i)
+        clusters[lab]["texts"].append(texts.iat[i])
+
+    rows: List[Dict[str, Any]] = []
+    for cidx, info in clusters.items():
+        idxs = info["idxs"]
+        ids_list = [str(df[id_col].iat[i]) for i in idxs]
+        rep_verbatims = info["texts"][:3]
+        # simple definition: top frequent words
+        words = " ".join(info["texts"]) if info["texts"] else ""
+        tokens = re.findall(r"\w+", words)
+        freq = defaultdict(int)
+        for t in tokens:
+            if t and t not in _STOPWORDS:
+                freq[t] += 1
+        top = sorted(freq.items(), key=lambda x: -x[1])[:6]
+        definition = ", ".join([w for w, _ in top[:4]]) or (rep_verbatims[0] if rep_verbatims else "")
+        rows.append({"code": None, "definition": definition, "ids": ids_list, "verbatims_representatifs": rep_verbatims})
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["code"] = list(range(1, len(out) + 1))
+    return out[["code", "definition", "ids", "verbatims_representatifs"]]
+
+
+def validate_codebook(codebook_df: pd.DataFrame, df_ids: List[str]) -> Dict[str, Any]:
+    """Valide le codebook en vérifiant ids inexistants, duplications, thèmes sans ids, ids non couverts."""
+    res = {
+        "ids_not_found": [],
+        "duplicated_ids_between_themes": [],
+        "themes_without_ids": [],
+        "ids_covered": set(),
+    }
+    if codebook_df is None or codebook_df.empty:
+        return res
+
+    df_id_set = set(str(x) for x in df_ids)
+    seen: Dict[str, int] = {}
+    for idx, row in codebook_df.iterrows():
+        ids = row.get("ids") or []
+        if isinstance(ids, str):
+            ids = [t for t in re.split(r"[;,\s]+", ids) if t.strip()]
+        if not ids:
+            res["themes_without_ids"].append(int(row.get("code") or (idx + 1)))
+        for i in ids:
+            s = str(i).strip()
+            if not s:
+                continue
+            if s not in df_id_set:
+                res["ids_not_found"].append(s)
+            res["ids_covered"].add(s)
+            seen[s] = seen.get(s, 0) + 1
+
+    # duplicated across themes
+    res["duplicated_ids_between_themes"] = [k for k, v in seen.items() if v > 1]
+    return res
+
+
+def _log_codification(action: str, details: Dict[str, Any]):
+    """Journal simple des actions de codification stocké dans `st.session_state['codification_log']`."""
+    if "codification_log" not in st.session_state:
+        st.session_state["codification_log"] = []
+    st.session_state["codification_log"].append({"action": action, "details": details})
+
+@st.cache_data(show_spinner="Génération du fichier Excel...")
+def export_final_excel(results: List[Dict[str, Any]], source_name: str) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        summary_rows = []
+        for r in results:
+            theme = r["sheet"]
+            coded_table = r["coded_table"]
+            legend_df = r["legend"]
+            question = r.get("question") or theme
+            coded_table.to_excel(writer, sheet_name=theme[:31], index=False, startrow=1)
+            start_col = coded_table.shape[1] + 2
+            legend_df.to_excel(writer, sheet_name=theme[:31], index=False, startcol=start_col, startrow=1)
+            ws = writer.sheets[theme[:31]]
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=coded_table.shape[1])
+            cell = ws.cell(row=1, column=1)
+            cell.value = question
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            dict_start_col = start_col
+            ws.merge_cells(start_row=1, start_column=dict_start_col, end_row=1, end_column=dict_start_col + max(1, legend_df.shape[1]) - 1)
+            dcell = ws.cell(row=1, column=dict_start_col)
+            dcell.value = "Dictionnaire"
+            dcell.font = Font(bold=True)
+            dcell.alignment = Alignment(horizontal="center", vertical="center")
+            n_rows = coded_table.shape[0] + 1
+            for col_idx, col_name in enumerate(coded_table.columns, start=1):
+                values = [str(col_name)] + [str(v) for v in coded_table[col_name].head(200).tolist()]
+                width = min(60, max(len(v) for v in values) + 2)
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+                if col_name.lower().startswith("code "):
+                    align = Alignment(horizontal="center")
+                elif col_name == r.get("txt_col"):
+                    align = Alignment(horizontal="left", wrap_text=True)
+                else:
+                    align = Alignment(horizontal="left")
+                for row_idx in range(2, n_rows + 1):
+                    ws.cell(row=row_idx, column=col_idx).alignment = align
+            for j in range(legend_df.shape[1]):
+                c = dict_start_col + j
+                ws.column_dimensions[get_column_letter(c)].width = 28 if j == 1 else 10
+            summary_rows.append({"Theme": theme, "Verbatims": len(coded_table), "Codes": len(legend_df)})
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="SUMMARY", index=False)
+    return buffer.getvalue()
+
+# Initialisation optimisée des états de session (une seule fois)
+def init_session_state():
+    """Initialise tous les états de session en une seule fois"""
+    defaults = {
+        "excel_files": [],
+        "current_sheet_idx": 0,
+        "all_sheets": [],
+        "processed_sheets": [],
+        "skipped_sheets": [],
+        "sheet_status": {},
+        "dict_cache": {}  # Cache pour les dictionnaires validés
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
+
+# Persistent per-sheet saved state
+if "sheet_states" not in st.session_state:
+    st.session_state.sheet_states = {}
+
+def _save_sheet_state(idx: int):
+    keys = [
+        f"result_{idx}", f"result_auto_{idx}", f"result_manual_{idx}", f"result_choice_{idx}",
+        f"codebook_{idx}", f"dict_text_{idx}", f"dict_hash_{idx}"
+    ]
+    state = {}
+    for k in keys:
+        if k in st.session_state:
+            try:
+                state[k] = copy.deepcopy(st.session_state[k])
+            except Exception:
+                state[k] = st.session_state[k]
+    if state:
+        st.session_state.sheet_states[str(idx)] = state
+
+def _restore_sheet_state(idx: int):
+    s = st.session_state.sheet_states.get(str(idx))
+    if not s:
+        return
+    for k, v in s.items():
+        st.session_state[k] = v
+
+def change_current_index(new_idx: int):
+    try:
+        curr = st.session_state.get("current_sheet_idx", 0)
+        _save_sheet_state(curr)
+    except Exception:
+        pass
+    # Clamp new_idx to valid range based on available sheets
+    total = len(st.session_state.get("all_sheets", []))
+    if total <= 0:
+        st.session_state.current_sheet_idx = 0
+    else:
+        clamped = max(0, min(new_idx, total - 1))
+        st.session_state.current_sheet_idx = clamped
+    try:
+        _restore_sheet_state(st.session_state.current_sheet_idx)
+    except Exception:
+        pass
+    st.rerun()
+
+# --- Action endpoints (central handlers returning a result dict) -----------------
+def endpoint_validate_and_continue(current: Dict[str, Any], current_idx: int, edited_df: pd.DataFrame, codebook_parsed: pd.DataFrame) -> Dict[str, Any]:
+    try:
+        coded_table = edited_df.copy()
+        # Nettoyage: supprimer les lignes vides ajoutées par l'éditeur (IDs manquants et texte vide et pas de codes)
+        def _sanitize_table(df_tbl: pd.DataFrame, id_col_name: str, txt_col_name: str) -> pd.DataFrame:
+            if df_tbl is None or df_tbl.empty:
+                return pd.DataFrame()
+            df = df_tbl.copy()
+            # identifier les colonnes de codes (ex: 'code 1', 'Code', 'code_1') en se basant sur prefix 'code '
+            code_cols = [c for c in df.columns if str(c).lower().startswith("code ") or str(c).lower().startswith("code_")]
+            # condition: id empty AND txt empty AND all code cols empty
+            cond_id_empty = df.get(id_col_name, pd.Series([pd.NA]*len(df))).astype(str).str.strip().eq("")
+            cond_txt_empty = df.get(txt_col_name, pd.Series([pd.NA]*len(df))).astype(str).str.strip().eq("")
+            if code_cols:
+                cond_codes_empty = df[code_cols].isna().all(axis=1) | df[code_cols].astype(str).apply(lambda row: row.str.strip().eq("").all(), axis=1)
+            else:
+                cond_codes_empty = pd.Series([True]*len(df))
+            keep_mask = ~(cond_id_empty & cond_txt_empty & cond_codes_empty)
+            out = df.loc[keep_mask].copy()
+            return out
+        try:
+            coded_table = _sanitize_table(coded_table, current.get("id_col"), current.get("txt_col"))
+        except Exception:
+            pass
+        legend_df = (
+            codebook_parsed[["code", "definition"]]
+            .rename(columns={"code": "Code", "definition": "Définition"})
+            .copy()
+            if not codebook_parsed.empty
+            else pd.DataFrame()
+        )
+        # replace any existing processed for this sheet
+        st.session_state.processed_sheets = [s for s in st.session_state.processed_sheets if s["sheet"] != current["sheet"]]
+        st.session_state.processed_sheets.append({
+            "sheet": current["sheet"],
+            "question": current.get("question"),
+            "id_col": current.get("id_col"),
+            "txt_col": current.get("txt_col"),
+            "coded_table": coded_table,
+            "legend": legend_df,
+        })
+        set_sheet_status(current_idx, "processed")
+        try:
+            _save_sheet_state(current_idx)
+        except Exception:
+            pass
+        total = len(st.session_state.all_sheets)
+        # move to next sheet (clamped inside change_current_index)
+        next_idx = current_idx + 1
+        if next_idx >= total:
+            next_idx = total - 1 if total > 0 else 0
+        change_current_index(next_idx)
+        # Log validation action
+        _log_codification("validate_and_continue", {"sheet": current.get("sheet"), "next_idx": next_idx})
+        return {"ok": True, "message": "Feuille validée avec succès"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def endpoint_reset_sheet(current_idx: int) -> Dict[str, Any]:
+    try:
+        keys_to_clean = [
+            f"result_{current_idx}",
+            f"codebook_{current_idx}",
+            f"result_auto_{current_idx}",
+            f"result_manual_{current_idx}",
+            f"result_choice_{current_idx}",
+            f"dict_hash_{current_idx}",
+            f"dict_text_{current_idx}",
+            f"codebook_parsed_{current_idx}",
+        ]
+        for key in keys_to_clean:
+            if key in st.session_state:
+                del st.session_state[key]
+        # also remove any persisted state
+        st.session_state.sheet_states.pop(str(current_idx), None)
+        return {"ok": True, "message": "Feuille réinitialisée"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def endpoint_skip_sheet(current: Dict[str, Any], current_idx: int) -> Dict[str, Any]:
+    try:
+        set_sheet_status(current_idx, "skipped")
+        st.session_state.skipped_sheets.append(current["sheet"])
+        next_idx = current_idx + 1
+        change_current_index(next_idx if next_idx < len(st.session_state.all_sheets) else len(st.session_state.all_sheets))
+        return {"ok": True, "message": "Feuille sautée"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def endpoint_generate_auto(current: Dict[str, Any], current_idx: int, method: str, model_name: Optional[str], min_cluster: Optional[int]) -> Dict[str, Any]:
+    try:
+        df_work = _filter_non_empty_rows(current["df"], current["txt_col"]) if current and current.get("df") is not None else pd.DataFrame()
+        if method == "tfidf":
+            suggested = suggest_dictionary_tfidf(df_work, current["id_col"], current["txt_col"]) if not df_work.empty else pd.DataFrame()
+        else:
+            suggested = suggest_dictionary_embeddings(df_work, current["id_col"], current["txt_col"], model_name=model_name or "all-MiniLM-L6-v2", min_cluster_size=min_cluster) if not df_work.empty else pd.DataFrame()
+        st.session_state[f"auto_codebook_{current_idx}"] = suggested
+        return {"ok": True, "message": f"{len(suggested)} thèmes proposés", "count": len(suggested)}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def endpoint_import_auto(edited: pd.DataFrame, current_idx: int) -> Dict[str, Any]:
+    try:
+        lines: List[str] = []
+        for _, r in edited.iterrows():
+            code = r.get("code")
+            definition = r.get("definition") or ""
+            ids_field = r.get("IDs") or ""
+            if isinstance(ids_field, list):
+                ids_str = ", ".join([str(x).strip() for x in ids_field if str(x).strip()])
+            else:
+                ids_str = str(ids_field)
+            line = f"{int(code) if pd.notna(code) else ''} {definition} {ids_str}".strip()
+            if line:
+                lines.append(line)
+        pasted = "\n".join(lines)
+        st.session_state[f"dict_text_{current_idx}"] = pasted
+        # store parsed codebook for reuse
+        try:
+            parsed = parse_text_dictionary(pasted)
+            st.session_state[f"codebook_parsed_{current_idx}"] = parsed
+        except Exception:
+            pass
+        return {"ok": True, "message": "Proposition importée"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+def endpoint_auto_treatment(current: Dict[str, Any], current_idx: int, codebook_parsed: pd.DataFrame, max_codes: int = 1) -> Dict[str, Any]:
+    try:
+        # Affichage exact des données telles qu'elles sont dans le fichier Excel
+        df_preview = current["df"]
+        df_display = df_preview.copy()
+        try:
+            df_display = df_display.astype(object).where(pd.notna(df_display), "")
+        except Exception:
+            pass
+        
+        # Afficher les informations de la feuille
+        st.markdown(
+            f'<div class="modern-card">'
+            f'<h3>📊 Aperçu de la feuille Excel • {html.escape(str(current["sheet"]))}</h3>'
+            f'<p>📄 <strong>Source:</strong> {html.escape(str(current["source"]))} • <strong>Lignes:</strong> {len(df_preview)} • <strong>Colonnes:</strong> {len(df_preview.columns)}</p>'
+            f'<p>🔍 <strong>Colonne ID détectée:</strong> {current["id_col"]} • <strong>Colonne texte détectée:</strong> {current["txt_col"]}</p>'
+            f'</div>', 
+            unsafe_allow_html=True
+        )
+        
+        # Afficher le tableau exactement comme dans Excel
+        st.dataframe(
+            df_display,
+                height=min(400, 35 * (len(df_preview) + 1)),  # Hauteur dynamique
+            use_container_width=True,
+            hide_index=False  # Afficher l'index pour correspondre à Excel
+        )
+        
+        df = current["df"]
+        id_col = current["id_col"]
+        txt_col = current["txt_col"]
+        raw_txt = df[txt_col]
+        s_txt = raw_txt.where(raw_txt.notna(), "")
+        s_txt = s_txt.astype(str)
+        mask = s_txt.str.strip().ne("") & s_txt.str.lower().ne("none")
+        df_work = df.loc[mask].copy()
+        # If the parsed dictionary is very large, prefer DB-backed assignment to avoid high memory usage
+        try:
+            total_ids = 0
+            if isinstance(codebook_parsed, pd.DataFrame) and "ids" in codebook_parsed.columns:
+                for v in codebook_parsed["ids"]:
+                    if v is None:
+                        continue
+                    try:
+                        total_ids += len(v)
+                    except Exception:
+                        # if stored as string, split heuristically
+                        total_ids += len(re.split(r"[;,\s]+", str(v)))
+            else:
+                total_ids = 0
+        except Exception:
+            total_ids = 0
+
+        # Lower threshold to favor DB-backed assignment earlier for robustness
+        LARGE_IDS_THRESHOLD = 1000
+        if total_ids > LARGE_IDS_THRESHOLD:
+            mapping_table = f"code_id_map_{current_idx}"
+            try:
+                st.info(f"Dictionnaire volumineux détecté ({total_ids} ids) — utilisation de SQLite pour l'assignation (cela peut prendre quelques instants)")
+                persist_mapping_table(codebook_parsed, db_path="dictionaries.db", mapping_table=mapping_table)
+                assigned = assign_codes_from_db(df_work, id_col, db_path="dictionaries.db", mapping_table=mapping_table, max_codes=max_codes)
+            except Exception:
+                st.warning("La voie DB a échoué ; utilisation de l'assignation en mémoire")
+                assigned = assign_codes_from_dict_with_ids(df_work, id_col, codebook_parsed, max_codes=max_codes)
+        else:
+            assigned = assign_codes_from_dict_with_ids(df_work, id_col, codebook_parsed, max_codes=max_codes)
+        max_codes = max(1, int(max_codes))
+        data = {id_col: df_work[id_col]}
+        for idx_code in range(max_codes):
+            col_name = f"code {idx_code + 1}"
+            data[col_name] = [row[idx_code] for row in assigned]
+        data[txt_col] = df_work[txt_col]
+        manual_df = pd.DataFrame(data)
+        for idx_code in range(1, max_codes + 1):
+            col_name = f"code {idx_code}"
+            if col_name in manual_df.columns:
+                manual_df[col_name] = manual_df[col_name].astype("Int64")
+        st.session_state[f"result_manual_{current_idx}"] = manual_df
+        st.session_state[f"codebook_{current_idx}"] = codebook_parsed
+        return {"ok": True, "message": "Traitement automatique exécuté", "rows": len(manual_df)}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+# Expose endpoint map for debugging
+ENDPOINTS = {
+    "validate_and_continue": endpoint_validate_and_continue,
+    "reset_sheet": endpoint_reset_sheet,
+    "skip_sheet": endpoint_skip_sheet,
+    "generate_auto": endpoint_generate_auto,
+    "import_auto": endpoint_import_auto,
+    "auto_treatment": endpoint_auto_treatment,
+}
+
+# Palette personnalisable (defaults)
+if "palette" not in st.session_state:
+    st.session_state["palette"] = {
+        "primary": "#007AFF",
+        "secondary": "#5856D6",
+        "bg": "#FAFAFA",
+        "card": "#FFFFFF",
+        "text": "#111111"
+    }
+
+# Sidebar palette control
+with st.sidebar.expander("🎨 Palette / Thème", expanded=False):
+    p = st.session_state["palette"]
+    p_primary = st.color_picker("Primary color", value=p["primary"], key="pal_primary")
+    p_secondary = st.color_picker("Secondary color", value=p["secondary"], key="pal_secondary")
+    p_bg = st.color_picker("Background", value=p["bg"], key="pal_bg")
+    p_card = st.color_picker("Card background", value=p["card"], key="pal_card")
+    p_text = st.color_picker("Text color", value=p["text"], key="pal_text")
+    st.session_state["palette"] = {"primary": p_primary, "secondary": p_secondary, "bg": p_bg, "card": p_card, "text": p_text}
+
+# Inject dynamic CSS overrides for palette
+pal = st.session_state.get("palette", {})
+st.markdown(f"""
+<style>
+:root{{--primary:{pal.get('primary','#007AFF')};--secondary:{pal.get('secondary','#5856D6')};--bg:{pal.get('bg','#FAFAFA')};--card:{pal.get('card','#FFFFFF')};--text:{pal.get('text','#111111')}}}
+</style>
+""", unsafe_allow_html=True)
+
+# Sidebar display controls (default: hidden)
+with st.sidebar.expander("Affichage (options avancées)", expanded=False):
+    show_auto_warnings = st.checkbox("Afficher alertes d'anomalies (IDs manquants / doublons)", value=False, key="show_auto_warnings")
+    show_quick_export = st.checkbox("Afficher boutons d'export rapide (CSV/TXT)", value=False, key="show_quick_export")
+
+# Internal flags (True = hidden)
+HIDE_AUTO_WARNINGS = not bool(st.session_state.get("show_auto_warnings", False))
+HIDE_QUICK_EXPORT = not bool(st.session_state.get("show_quick_export", False))
+
+@lru_cache(maxsize=128)
+def get_sheet_status(idx: int) -> str:
+    """Récupère le statut d'une feuille avec cache"""
+    if idx in st.session_state.sheet_status:
+        return st.session_state.sheet_status[idx]
+    return "pending"
+
+def set_sheet_status(idx: int, status: str):
+    """Définit le statut d'une feuille et invalide le cache"""
+    st.session_state.sheet_status[idx] = status
+    get_sheet_status.cache_clear()  # Invalider le cache
+
+def get_status_badge(status: str) -> str:
+    badges = {
+        "pending": "⚪ En attente",
+        "current": "🔵 En cours",
+        "processed": "✅ Validée",
+        "skipped": "⏭️ Sautée"
+    }
+    return badges.get(status, "⚪ En attente")
+
+def render_modern_card(content: str, card_type: str = "default"):
+    if card_type == "hero":
+        st.markdown(f'<div class="hero-card">{content}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="modern-card">{content}</div>', unsafe_allow_html=True)
+
+# Interface principale - En-tête compact
+st.markdown('<div class="hero-card"><h1>🎯 Codification Assistée</h1><p>Workflow professionnel avec IA</p></div>', unsafe_allow_html=True)
+
+# Chargement des fichiers - Interface épurée
+if not st.session_state.all_sheets:
+    try:
+        uploaded = st.file_uploader(
+            "Fichier Excel à analyser",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            key="uploader",
+            label_visibility="collapsed",
+        )
+    except TypeError:
+        uploaded = st.file_uploader(
+            "",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            key="uploader",
+        )
+    
+    if uploaded and not st.session_state.excel_files:
+        progress_bar = st.progress(0, text="Chargement en cours...")
+        
+        for i, up in enumerate(uploaded):
+            try:
+                progress_bar.progress((i + 1) / len(uploaded), text=f"Initialisation IA: chargement des dépendances et préparation des modules (TF‑IDF/embeddings) pour {up.name}...")
+                xbytes = up.getvalue()
+                xls = pd.ExcelFile(io.BytesIO(xbytes))
+                st.session_state.excel_files.append({"name": up.name, "bytes": xbytes, "xls": xls})
+                
+                for sheet in xls.sheet_names:
+                    df = _read_sheet_with_header_detection(xls, sheet)
+                    if df.empty or df.shape[1] == 0:
+                        continue
+                    question = read_sheet_question(xbytes, sheet)
+                    if not question:
+                        question = _extract_question_from_columns(list(df.columns))
+                    id_col, txt_col = detect_columns(df)
+                    st.session_state.all_sheets.append({
+                        "source": up.name,
+                        "sheet": sheet,
+                        "df": df,
+                        "question": question,
+                        "id_col": id_col,
+                        "txt_col": txt_col
+                    })
+            except Exception as e:
+                st.error(f"❌ Erreur lors du traitement de {up.name}: {e}")
+        
+        progress_bar.progress(1.0, text="✅ Chargement terminé!")
+        st.rerun()
+else:
+    # Résumé des fichiers chargés
+    file_names = [f["name"] for f in st.session_state.excel_files]
+    st.markdown(f'<div class="modern-card"><h3>✅ Données chargées • Prêt à coder</h3><p><strong>{len(file_names)} fichier(s):</strong> {", ".join(file_names)}</p><p>🎯 <strong>{len(st.session_state.all_sheets)} feuille(s)</strong> à traiter • Commençons !</p></div>', unsafe_allow_html=True)
+
+# Interface principale si des feuilles sont chargées
+if st.session_state.all_sheets:
+    total = len(st.session_state.all_sheets)
+    current_idx = st.session_state.current_sheet_idx
+
+    # Sidebar avec progression uniquement (sans liste des feuilles)
+    with st.sidebar:
+        st.markdown("### 🗂️ Navigation")
+        
+        # Métriques de progression
+        processed_count = len([i for i in range(total) if get_sheet_status(i) == "processed"])
+        skipped_count = len([i for i in range(total) if get_sheet_status(i) == "skipped"])
+        
+        # Card de progression compacte
+        progress_pct = processed_count / max(1, total)
+        st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #007AFF 0%, #5856D6 100%); 
+                       padding: 0.75rem; border-radius: 8px; margin-bottom: 0.75rem; text-align: center;">
+                <h2 style="color: white; margin: 0; font-size: 0.9rem;">Progression</h2>
+                <h1 style="color: white; margin: 0.25rem 0; font-size: 1.5rem; border: none;">{processed_count}/{total}</h1>
+                <p style="color: rgba(255,255,255,0.9); margin: 0; font-size: 0.75rem;">validées</p>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        # Métriques compactes en ligne
+        st.markdown(f"""
+            <div style="display: flex; gap: 0.4rem; margin-bottom: 0.75rem;">
+                <div style="background: rgba(52, 199, 89, 0.1); padding: 0.4rem; border-radius: 6px; text-align: center; flex: 1;">
+                    <p style="color: #34C759; font-weight: 600; margin: 0; font-size: 0.65rem;">✅ {processed_count}</p>
+                </div>
+                <div style="background: rgba(255, 149, 0, 0.1); padding: 0.4rem; border-radius: 6px; text-align: center; flex: 1;">
+                    <p style="color: #FF9500; font-weight: 600; margin: 0; font-size: 0.65rem;">⏭️ {skipped_count}</p>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        # Barre de progression compacte
+        st.progress(progress_pct, text=f"{int(100*progress_pct)}%")
+        
+        # Note : Liste des feuilles supprimée pour simplifier l'interface
+
+    # Interface principale de codification
+    if current_idx >= total:
+        # Écran de fin
+        st.markdown(f'<div class="modern-card"><h2>🎉 Félicitations !</h2><p>Toutes les feuilles ont été traitées avec succès</p><p><strong>{len(st.session_state.processed_sheets)} feuilles codifiées</strong> • <strong>{len(st.session_state.skipped_sheets)} feuilles sautées</strong></p></div>', unsafe_allow_html=True)
+        
+        if st.session_state.processed_sheets:
+            data = export_final_excel(st.session_state.processed_sheets, "codification")
+            st.download_button(
+                "📥 Télécharger • Résultats complets Excel",
+                data=data,
+                file_name="codification_finale.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                help="Obtenez votre fichier Excel final avec toutes les feuilles codifiées et les dictionnaires"
+            )
+        
+        if st.button("🔄 Recommencer • Nouveau projet", type="secondary", help="Démarrez une nouvelle session de codification"):
+            for k in ["excel_files", "current_sheet_idx", "all_sheets", "processed_sheets", "skipped_sheets", "sheet_status"]:
+                if k == "current_sheet_idx":
+                    st.session_state[k] = 0
+                else:
+                    st.session_state[k] = [] if k != "sheet_status" else {}
+            st.rerun()
+    else:
+        # Interface de codification pour la feuille courante
+        current = st.session_state.all_sheets[current_idx]
+        set_sheet_status(current_idx, "current")
+        
+        # En-tête de la feuille courante avec navigation
+        st.markdown(
+            f'<div class="hero-card"><h1>📄 Feuille {current_idx + 1}/{total}</h1><h2>{html.escape(str(current["sheet"]))}</h2><p><strong>Source:</strong> {html.escape(str(current["source"]))}</p></div>',
+            unsafe_allow_html=True,
+        )
+        if current.get("question"):
+            st.markdown(
+                f'<div class="question-banner"><div class="qb-label">Question</div><div class="qb-text">{html.escape(str(current["question"]))}</div></div>',
+                unsafe_allow_html=True,
+            )
+        
+        # Navigation rapide entre feuilles
+        if total > 1:
+            col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+            with col_nav1:
+                if current_idx > 0:
+                    if st.button("⬅️ Précédente", key="nav_prev", help="Feuille précédente"):
+                        change_current_index(current_idx - 1)
+            with col_nav2:
+                # Sélecteur de feuille compact
+                sheet_options = [f"[{i+1}] {s['sheet'][:25]}" for i, s in enumerate(st.session_state.all_sheets)]
+                selected = st.selectbox(
+                    "🔄 Changer de feuille:",
+                    options=range(len(sheet_options)),
+                    format_func=lambda x: sheet_options[x],
+                    index=current_idx,
+                    key="sheet_selector"
+                )
+                if selected != current_idx:
+                    change_current_index(selected)
+            with col_nav3:
+                if current_idx < total - 1:
+                    if st.button("➡️ Suivante", key="nav_next", help="Feuille suivante"):
+                        change_current_index(current_idx + 1)
+        
+        # Bouton d'action principal unifié
+        status = get_sheet_status(current_idx)
+        
+        col_main, col_nav = st.columns([3, 1])
+        with col_main:
+            # Bouton intelligent qui s'adapte au contexte
+            if status == "processed":
+                # Feuille déjà traitée - proposer modification ou passage à la suivante
+                action_choice = st.radio(
+                    "Action rapide :",
+                    ["✏️ Modifier cette feuille", "⏭️ Passer à la suivante"],
+                    horizontal=True,
+                    key=f"action_choice_{current_idx}"
+                )
+                
+                if st.button("🚀 Exécuter l'action", type="primary", key="unified_action", help="Cliquez pour exécuter l'action sélectionnée"):
+                    if action_choice == "✏️ Modifier cette feuille":
+                        set_sheet_status(current_idx, "current")
+                        st.session_state.processed_sheets = [s for s in st.session_state.processed_sheets if s["sheet"] != current["sheet"]]
+                        st.rerun()
+                    else:  # Passer à la suivante
+                        set_sheet_status(current_idx, "skipped")
+                        st.session_state.skipped_sheets.append(current["sheet"])
+                        next_idx = current_idx + 1
+                        change_current_index(next_idx if next_idx < total else total)
+            else:
+                # Feuille non traitée - proposer traitement ou passage
+                if st.button("⏭️ Passer à la suivante • Gagner du temps", type="secondary", key="skip_action", help="Sautez cette feuille pour vous concentrer sur les plus importantes"):
+                    set_sheet_status(current_idx, "skipped")
+                    st.session_state.skipped_sheets.append(current["sheet"])
+                    next_idx = current_idx + 1
+                    change_current_index(next_idx if next_idx < total else total)
+        
+        with col_nav:
+            # Navigation compacte
+            if current_idx > 0:
+                if st.button("⬅️", key="prev_sheet", help="Feuille précédente"):
+                    change_current_index(current_idx - 1)
+                    
+   # Interface de codification
+        # Options avancées (colonnes)
+        if False:
+            cols_all = list(current["df"].columns)
+            idx_id = cols_all.index(current["id_col"]) if current["id_col"] in cols_all else 0
+            idx_txt = cols_all.index(current["txt_col"]) if current["txt_col"] in cols_all else (1 if len(cols_all) > 1 else 0)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                new_id = st.selectbox("Colonne ID", options=cols_all, index=idx_id, key=f"sel_id_{current_idx}")
+            with col2:
+                new_txt = st.selectbox("Colonne texte", options=cols_all, index=idx_txt, key=f"sel_txt_{current_idx}")
+            
+            if new_id != current["id_col"] or new_txt != current["txt_col"]:
+                current["id_col"] = new_id
+                current["txt_col"] = new_txt
+                # Nettoyer les résultats cachés
+
+        # -------------------------
+        # Étape 1  Aperçu initial  affichage exact de la feuille Excel
+        try:
+            df_raw = current["df"]
+            st.markdown(
+                f'<div class="modern-card"><h3> Étape 1  Aperçu de la feuille Excel</h3>'
+                f'<p> <strong>Source:</strong> {html.escape(str(current["source"]))} • '
+                f'<strong>Feuille:</strong> {html.escape(str(current["sheet"]))}  '
+                f'<strong>Lignes:</strong> {len(df_raw)} • '
+                f'<strong>Colonnes:</strong> {len(df_raw.columns)}</p>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            try:
+                from st_aggrid import AgGrid, GridOptionsBuilder
+                gb = GridOptionsBuilder.from_dataframe(df_raw, enableRowGroup=False, enableValue=False, enablePivot=False)
+                gb.configure_default_column(editable=False, filter=False, sortable=False, resizable=True)
+                grid_options = gb.build()
+                AgGrid(
+                    df_raw,
+                    gridOptions=grid_options,
+                    enable_enterprise_modules=False,
+                    height=[Math]::Min(600, [Math]::Max(300, 35 * (df_raw.shape[0] + 1))),
+                    width='100%',
+                    key=("sheet_preview_" + $([string]$null)),
+                    update_mode='NO_UPDATE',
+                    fit_columns_on_grid_load=False,
+                    allow_unsafe_jscode=False
+                )
+            except Exception:
+                st.dataframe(
+                    df_raw,
+                    height=min(400, 35 * (len(df_raw) + 1)),
+                    width='stretch',
+                    hide_index=False
+                )
+        except Exception as e:
+            st.warning(f" Impossible d'afficher l'aperçu initial: {e}")        # Sous-étape 2A • Proposition automatique de thèmes
+        # -------------------------
+        try:
+            col_id = current["id_col"]
+            col_txt = current["txt_col"]
+            st.markdown('<div class="modern-card"><h3>🧠 Étape 2A • Proposition automatique de thèmes</h3><p>💡 Laissez l’IA proposer des thèmes à partir des verbatims (non contraignant).</p></div>', unsafe_allow_html=True)
+
+            gen_cols = st.columns([3, 1])
+            with gen_cols[0]:
+                method = st.selectbox(
+                    "Méthode",
+                    options=["tfidf", "embeddings"],
+                    index=0,
+                    help="tfidf: rapide; embeddings: meilleure qualité (plus lent).",
+                    key=f"auto_method_{current_idx}"
+                )
+                model_name = None
+                min_cluster = None
+                if method == "embeddings":
+                    st.info("Embeddings activés — cela peut prendre plus de temps selon la taille du fichier.")
+                    model_name = st.selectbox("Modèle d'embeddings", options=["all-MiniLM-L6-v2", "paraphrase-MiniLM-L3-v2"], index=0, key=f"embed_model_{current_idx}")
+                    min_cluster = st.slider("Taille minimale d'un cluster", min_value=2, max_value=200, value=max(3, len(current['df'])//100), key=f"min_cluster_{current_idx}")
+            with gen_cols[1]:
+                if st.button("🚀 Générer un dictionnaire automatiquement", key=f"gen_auto_{current_idx}"):
+                    try:
+                        res = ENDPOINTS["generate_auto"](current, current_idx, method, model_name, min_cluster)
+                        if res.get("ok"):
+                            st.success(res.get("message") or "✅ Génération terminée")
+                        else:
+                            st.error(res.get("message") or "Erreur lors de la génération automatique")
+                    except Exception as e:
+                        st.error(f"Erreur lors de la génération automatique: {e}")
+
+            # Afficher la proposition si présente
+            auto_cb = st.session_state.get(f"auto_codebook_{current_idx}")
+            if isinstance(auto_cb, pd.DataFrame) and not auto_cb.empty:
+                display_cb = auto_cb.copy()
+                # Ensure ids are rendered cleanly (handle lists of ints/strs)
+                display_cb["ids_display"] = display_cb["ids"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, (list, tuple)) else str(x))
+                display_df = display_cb[["code", "definition", "ids_display", "verbatims_representatifs"]].rename(columns={"ids_display": "IDs"})
+
+                st.markdown('<div class="modern-card"><h4>🧾 Dictionnaire proposé • Éditez si besoin</h4></div>', unsafe_allow_html=True)
+                edited = st.data_editor(display_df, key=f"auto_editor_{current_idx}", num_rows="dynamic", use_container_width=True, height=300)
+
+                # Validation légère
+                diagnostics = validate_codebook(pd.DataFrame({
+                    "code": edited["code"].tolist(),
+                    "definition": edited["definition"].tolist(),
+                    "ids": edited["IDs"].tolist(),
+                }), list(current["df"][col_id].astype(str)))
+
+                if diagnostics["ids_not_found"] and not HIDE_AUTO_WARNINGS:
+                    st.warning(f"⚠️ IDs non trouvés dans les données: {', '.join(map(str, sorted(set(diagnostics['ids_not_found']))))[:400]}")
+                if diagnostics["duplicated_ids_between_themes"] and not HIDE_AUTO_WARNINGS:
+                    st.warning(f"⚠️ IDs dupliqués entre thèmes: {', '.join(map(str, sorted(set(diagnostics['duplicated_ids_between_themes']))))[:400]}")
+                if diagnostics["themes_without_ids"]:
+                    st.info(f"ℹ️ Thèmes sans ID: {', '.join([str(x) for x in diagnostics['themes_without_ids']])}")
+
+                # Importer dans la zone de collage si l'utilisateur valide
+                if st.button("↪️ Importer cette proposition dans la zone de collage", key=f"import_auto_{current_idx}"):
+                    try:
+                        res = ENDPOINTS["import_auto"](edited, current_idx)
+                        if res.get("ok"):
+                            st.success(res.get("message") or "✅ Proposition importée")
+                        else:
+                            st.error(res.get("message") or "Erreur lors de l'import")
+                    except Exception as e:
+                        st.error(f"Erreur lors de l'import: {e}")
+        except Exception:
+            # Ne pas planter l'interface principale si l'étape auto échoue
+            pass
+
+        # Section dictionnaire
+        st.markdown("---")
+        st.markdown('<div class="modern-card"><h3>📝 Étape 2 • Créez votre dictionnaire</h3><p>👇 Collez vos thèmes ci-dessous • Format flexible accepté</p><p>💡 <code>1 Nom du thème 27, 31, 34</code> • <em>Un thème par ligne</em></p></div>', unsafe_allow_html=True)
+
+        # Exemple
+        with st.expander("💡 Exemple • Comment formater votre dictionnaire"):
+            st.code("""1 Souscription faite par une autre personne 27, 31, 34, 37
+2 Oubli / mémoire floue 44, 54, 71
+3 Souscription faite soi-même 115, 126, 276""", language="text")
+
+        # Zone de saisie du dictionnaire (validation explicite pour éviter les recalculs à chaque rerun)
+        dict_text = st.session_state.get(f"dict_text_{current_idx}", "")
+        with st.form(key=f"dict_form_{current_idx}", clear_on_submit=False):
+            st.text_area(
+                "📋 Collez votre dictionnaire • L'IA comprend tous les formats",
+                height=150,
+                key=f"dict_text_{current_idx}",
+                placeholder="1 Premier thème 27, 31, 34\n2 Deuxième thème 44, 54, 71\n3 Troisième thème 115, 126",
+                help="💡 Formats acceptés : séparateurs |, :, -, virgules... L'IA s'adapte automatiquement !"
+            )
+            submitted = st.form_submit_button("✅ Valider le dictionnaire")
+
+        dict_text = st.session_state.get(f"dict_text_{current_idx}", "")
+
+        # Traitement du dictionnaire (uniquement à la validation, sinon réutilisation)
+        if dict_text.strip():
+            codebook_parsed = pd.DataFrame()
+            try:
+                if submitted:
+                    try:
+                        new_hash = hashlib.md5(dict_text.encode("utf-8")).hexdigest()
+                    except Exception:
+                        new_hash = str(len(dict_text))
+
+                    prev_hash = st.session_state.get(f"dict_hash_{current_idx}")
+                    if prev_hash != new_hash:
+                        st.session_state[f"dict_hash_{current_idx}"] = new_hash
+                        # Nettoyer les résultats cachés
+                        for key in [f"result_{current_idx}", f"codebook_{current_idx}", f"result_auto_{current_idx}", f"result_manual_{current_idx}", f"result_choice_{current_idx}"]:
+                            if key in st.session_state:
+                                del st.session_state[key]
+
+                    try:
+                        codebook_parsed = parse_text_dictionary(dict_text)
+                        st.session_state[f"codebook_parsed_{current_idx}"] = codebook_parsed
+                        # Persister automatiquement la version robuste du dictionnaire en SQLite (optionnel)
+                        try:
+                            persist_dict_to_sqlite(codebook_parsed, db_path="dictionaries.db", table_name=f"codebook_{current_idx}")
+                        except Exception:
+                            pass
+                        # Téléchargements du dictionnaire retirés (désactivés par demande utilisateur)
+                    except Exception:
+                        st.session_state[f"codebook_parsed_{current_idx}"] = pd.DataFrame()
+
+                    # Marquer le dictionnaire comme validé (form soumis) pour afficher les étapes suivantes
+                    if submitted:
+                        st.session_state[f"dict_validated_{current_idx}"] = True
+                        parsed = st.session_state.get(f"codebook_parsed_{current_idx}")
+                        if parsed is None or parsed.empty:
+                            st.warning("⚠️ Le dictionnaire n'a pas pu être analysé correctement. Vérifiez le format ou corrigez les lignes.")
+                        else:
+                            st.success(f"✅ Dictionnaire validé — {len(parsed)} thèmes détectés. Passez à l'étape 3.")
+                        # Le drapeau `dict_validated_{current_idx}` suffit pour afficher l'étape 3
+                        # Forcer un rerun pour afficher immédiatement l'étape 3 après validation
+                        st.rerun()
+                else:
+                    codebook_parsed = st.session_state.get(f"codebook_parsed_{current_idx}")
+                    if not isinstance(codebook_parsed, pd.DataFrame):
+                        codebook_parsed = pd.DataFrame()
+
+                    if not codebook_parsed.empty:
+                        st.success(f"✅ {len(codebook_parsed)} thèmes détectés avec succès")
+
+                        # Affichage du dictionnaire parsé
+                        st.markdown('<div class="modern-card"><h4>✅ Thèmes détectés • Vérifiez et continuez</h4></div>', unsafe_allow_html=True)
+
+                        st.dataframe(
+                            codebook_parsed[["code", "definition"]].rename(columns={"code": "Code", "definition": "Définition"}),
+                            height=300,
+                            use_container_width=True
+                        )
+
+                        # Vue détaillée avec IDs
+                        with st.expander("🔍 Voir les détails avec les IDs de verbatims"):
+                            display_df = codebook_parsed.copy()
+                            display_df["ids_display"] = display_df["ids"].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, (list, tuple)) else (str(x) if pd.notna(x) else ""))
+                            st.dataframe(
+                                display_df[["code", "definition", "ids_display"]].rename(columns={
+                                    "code": "Code", 
+                                    "definition": "Définition", 
+                                    "ids_display": "IDs Verbatims"
+                                }),
+                                height=300,
+                                use_container_width=True
+                            )
+
+                    # Contrôle: nombre maximum de codes par verbatim (multicodification)
+                    default_max_codes = max(1, min(10, max(1, len(codebook_parsed) // 10)))
+                    max_codes_selected = st.slider(
+                        "Nombre maximal de codes par verbatim",
+                        min_value=1,
+                        max_value=10,
+                        value=st.session_state.get(f"max_codes_{current_idx}", default_max_codes),
+                        key=f"max_codes_{current_idx}",
+                        help="Limite du nombre de codes attachés à chaque verbatim (multicodage)."
+                    )
+
+                    # Validation et nettoyage des codes (avec cache)
+                    dict_hash = hashlib.md5(dict_text.encode("utf-8")).hexdigest()
+                    
+                    # Vérifier si ce dictionnaire a déjà été validé
+                    if dict_hash not in st.session_state.dict_cache:
+                        numeric_ok = False
+                        unique_ok = False
+                        if "code" in codebook_parsed.columns:
+                            numeric_ok = pd.to_numeric(codebook_parsed["code"], errors="coerce").notna().all()
+                            unique_ok = codebook_parsed["code"].astype(str).is_unique
+                        
+                        if not (numeric_ok and unique_ok):
+                            codebook_parsed["code"] = list(range(1, len(codebook_parsed) + 1))
+                            st.info("ℹ️ Les codes ont été renumérotés automatiquement pour assurer l'unicité.")
+                        
+                        # Mettre en cache le dictionnaire validé
+                        st.session_state.dict_cache[dict_hash] = codebook_parsed.copy()
+                    else:
+                        # Réutiliser le dictionnaire validé depuis le cache
+                        codebook_parsed = st.session_state.dict_cache[dict_hash].copy()
+
+                    # Exports rapides désactivés (boutons retirés)
+
+                    # Traitement automatique
+                    # Génération automatique si pas encore fait ou après validation du dictionnaire
+                    if st.session_state.get(f"dict_validated_{current_idx}", False) or f"result_auto_{current_idx}" not in st.session_state:
+                        df = current["df"]
+                        id_col = current["id_col"]
+                        txt_col = current["txt_col"]
+
+                        # Filtrage des données (optimisé avec fonction cachée)
+                        df_work = _filter_non_empty_rows(df, txt_col)
+
+                        # Vérification du dictionnaire avant codification
+                        try:
+                            diagnostics = validate_codebook(codebook_parsed, list(df_work[id_col].astype(str)))
+                        except Exception:
+                            diagnostics = {"ids_not_found": [], "duplicated_ids_between_themes": [], "themes_without_ids": [], "ids_covered": set()}
+
+                        has_issues = bool(diagnostics.get("ids_not_found") or diagnostics.get("duplicated_ids_between_themes") or diagnostics.get("themes_without_ids"))
+                        if has_issues:
+                            if diagnostics.get("ids_not_found") and not HIDE_AUTO_WARNINGS:
+                                st.warning(f"⚠️ IDs non trouvés: {', '.join(map(str, sorted(set(diagnostics['ids_not_found']))))[:400]}")
+                            if diagnostics.get("duplicated_ids_between_themes") and not HIDE_AUTO_WARNINGS:
+                                st.warning(f"⚠️ IDs dupliqués entre thèmes: {', '.join(map(str, sorted(set(diagnostics['duplicated_ids_between_themes']))))[:400]}")
+                            if diagnostics.get("themes_without_ids") and not HIDE_AUTO_WARNINGS:
+                                st.info(f"ℹ️ Thèmes sans ID: {', '.join([str(x) for x in diagnostics['themes_without_ids']])}")
+
+                            if not HIDE_AUTO_WARNINGS:
+                                ignore = st.checkbox("Ignorer les anomalies et générer malgré tout (à utiliser avec précaution)", key=f"ignore_warnings_auto_{current_idx}")
+                            else:
+                                ignore = True
+                        else:
+                            ignore = True
+
+                        if not has_issues or ignore:
+                            # Attribution des codes (respecter la limite choisie si fournie)
+                            try:
+                                sel = st.session_state.get(f"max_codes_{current_idx}", None)
+                            except Exception:
+                                sel = None
+                            assigned = assign_codes_from_dict_with_ids(df_work, id_col, codebook_parsed, max_codes=sel)
+                            inferred = len(assigned[0]) if assigned else 1
+                            max_codes = max(1, min(int(max_codes_selected), inferred))
+
+                            # Construction du DataFrame résultat
+                            data = {id_col: df_work[id_col]}
+                            for idx_code in range(max_codes):
+                                col_name = f"code {idx_code + 1}"
+                                data[col_name] = [row[idx_code] for row in assigned]
+                            data[txt_col] = df_work[txt_col]
+
+                            auto_df = pd.DataFrame(data)
+                            for idx_code in range(1, max_codes + 1):
+                                col_name = f"code {idx_code}"
+                                if col_name in auto_df.columns:
+                                    auto_df[col_name] = auto_df[col_name].astype("Int64")
+
+                            st.session_state[f"result_auto_{current_idx}"] = auto_df
+                            if f"result_{current_idx}" not in st.session_state:
+                                st.session_state[f"result_{current_idx}"] = auto_df
+                                st.session_state[f"result_choice_{current_idx}"] = "Automatique"
+                            st.session_state[f"codebook_{current_idx}"] = codebook_parsed
+
+                            # Journaliser l'action
+                            log = st.session_state.get("codification_log", [])
+                            log_entry = {
+                                "action": "generate_auto",
+                                "sheet": current["sheet"],
+                                "time": pd.Timestamp.now().isoformat(),
+                                "issues": diagnostics
+                            }
+                            log.append(log_entry)
+                            st.session_state["codification_log"] = log
+                        else:
+                            st.info("🚫 Génération automatique suspendue. Corrigez le dictionnaire ou cochez 'Ignorer' pour forcer la génération.")
+
+                    # Bouton de traitement manuel
+                    st.markdown("---")
+                    st.markdown('<div class="modern-card"><h3>⚡ Étape 3 • Codification automatique</h3><p>🚀 L\'IA va maintenant coder vos verbatims • Cliquez pour lancer</p></div>', unsafe_allow_html=True)
+
+                    if st.button("🚀 Traitement IA • Codification instantanée", type="primary", key=f"auto_btn_{current_idx}", help="L'IA analyse et code automatiquement vos verbatims en quelques secondes"):
+                        try:
+                            res = ENDPOINTS["auto_treatment"](current, current_idx, codebook_parsed, st.session_state.get(f"max_codes_{current_idx}", 1))
+                            if res.get("ok"):
+                                st.success(res.get("message") or "✅ Traitement automatique effectué")
+                            else:
+                                st.error(res.get("message") or "Erreur lors du traitement automatique")
+                        except Exception as e:
+                            st.error(f"Erreur lors du traitement automatique: {e}")
+
+                    # Sélection de la version et édition
+                    auto_df = st.session_state.get(f"result_auto_{current_idx}")
+                    manual_df = st.session_state.get(f"result_manual_{current_idx}")
+                    
+                    # Choix de la version
+                    choices = []
+                    if auto_df is not None:
+                        choices.append("Automatique")
+                    if manual_df is not None:
+                        choices.append("Manuelle")
+
+                    if choices:
+                        choice = st.radio(
+                            "Choisir la version à éditer :",
+                            choices,
+                            index=0,
+                            key=f"choice_{current_idx}",
+                            horizontal=True
+                        )
+                        
+                        prev = st.session_state.get(f"result_choice_{current_idx}")
+                        if prev != choice or f"result_{current_idx}" not in st.session_state:
+                            st.session_state[f"result_choice_{current_idx}"] = choice
+                            if choice == "Automatique" and auto_df is not None:
+                                st.session_state[f"result_{current_idx}"] = auto_df
+                            elif choice == "Manuelle" and manual_df is not None:
+                                st.session_state[f"result_{current_idx}"] = manual_df
+                            st.session_state[f"codebook_{current_idx}"] = codebook_parsed
+
+                    # Éditeur de données
+                    if f"result_{current_idx}" in st.session_state:
+                        st.markdown("---")
+                        st.markdown('<div class="modern-card"><h3>✏️ Étape 3 • Vérification et correction</h3><p>Vérifiez et corrigez les codes attribués. Vous pouvez modifier directement dans le tableau.</p></div>', unsafe_allow_html=True)
+
+                        result_df = st.session_state[f"result_{current_idx}"]
+
+                        # Éditeur de données
+                        edited_df = st.data_editor(
+                            result_df,
+                            num_rows="dynamic",
+                            key=f"editor_{current_idx}",
+                            height=500,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        # Nettoyage automatique des lignes vides dans l'éditeur
+                        try:
+                            cleaned = sanitize_table(edited_df, current["id_col"], current["txt_col"])
+                            st.session_state[f"result_{current_idx}"] = cleaned
+                        except Exception:
+                            st.session_state[f"result_{current_idx}"] = edited_df
+                        
+                        # Métriques de contrôle qualité
+                        id_col = current["id_col"]
+                        code_cols = [c for c in edited_df.columns if c.lower().startswith("code ")]
+                        n_rows = len(edited_df)
+                        
+                        # Calculs des métriques
+                        if code_cols:
+                            non_na_counts = edited_df[code_cols].notna().sum(axis=1)
+                        else:
+                            non_na_counts = pd.Series([0] * n_rows)
+                        
+                        covered = int((non_na_counts >= 1).sum()) if n_rows else 0
+                        coverage_pct = round(100 * covered / n_rows, 1) if n_rows else 0.0
+                        max_multi = int(non_na_counts.max()) if n_rows else 0
+                        
+                        # IDs manquants
+                        missing_id_mask = edited_df[id_col].isna() | edited_df[id_col].astype(str).str.strip().eq("")
+                        missing_id_count = int(missing_id_mask.sum())
+                        
+                        # Affichage des métriques
+                        st.markdown('<div class="modern-card"><h4>🎯 Contrôles de qualité</h4></div>', unsafe_allow_html=True)
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Verbatims", n_rows)
+                        with col2:
+                            st.metric("Avec codes", f"{covered} ({coverage_pct}%)")
+                        with col3:
+                            st.metric("Multi-codage max", max_multi)
+                        with col4:
+                            st.metric("IDs manquants", missing_id_count, delta=-missing_id_count if missing_id_count > 0 else None)
+                        
+                        # Boutons de finalisation
+                        st.markdown("---")
+                        st.markdown('<div class="modern-card"><h3>🏁 Étape 4 • Finalisation</h3><p>Validez cette feuille pour passer à la suivante ou réinitialisez pour recommencer.</p></div>', unsafe_allow_html=True)
+                        
+                        col1, col2, col3 = st.columns([3, 2, 2])
+                        
+                        with col1:
+                            if st.button("✅ Valider & Continuer • Feuille suivante", type="primary", key=f"validate_{current_idx}", help="Enregistrez cette feuille et passez automatiquement à la suivante"):
+                                try:
+                                    res = ENDPOINTS["validate_and_continue"](current, current_idx, edited_df, codebook_parsed)
+                                    if res.get("ok"):
+                                        st.success(res.get("message") or "✅ Feuille validée avec succès!")
+                                    else:
+                                        st.error(res.get("message") or "Erreur lors de la validation")
+                                except Exception as e:
+                                    st.error(f"Erreur lors de la validation: {e}")
+                        
+                        with col2:
+                            if st.button("🔄 Recommencer • Repartir à zéro", key=f"reset_{current_idx}", help="Effacez tout le travail sur cette feuille pour recommencer"):
+                                try:
+                                    res = ENDPOINTS["reset_sheet"](current_idx)
+                                    if res.get("ok"):
+                                        st.success(res.get("message") or "✅ Réinitialisé")
+                                        st.rerun()
+                                    else:
+                                        st.error(res.get("message") or "Erreur lors de la réinitialisation")
+                                except Exception as e:
+                                    st.error(f"Erreur lors de la réinitialisation: {e}")
+
+                        with col3:
+                            # Navigation rapide
+                            total = len(st.session_state.all_sheets)
+                            if current_idx < total - 1:
+                                if st.button("⏭️ Suivante • Continuer le workflow", key=f"next_{current_idx}", help="Passez à la feuille suivante sans valider celle-ci"):
+                                    change_current_index(current_idx + 1)
+                            else:
+                                st.info("📄 Vous êtes déjà sur la dernière feuille")
+
+            except Exception as e:
+                st.error(f"❌ Erreur lors de l'analyse du dictionnaire: {e}")
+
+
+
