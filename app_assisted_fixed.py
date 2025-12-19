@@ -297,102 +297,67 @@ def afficher_excel_brut(df: pd.DataFrame) -> None:
         st.dataframe(df, use_container_width=True)
 
 def afficher_interface_principale():
-    """Affiche l'interface principale unifiée de l'application."""
-    # Configuration de la page
+    """Affiche uniquement la visualisation fidèle 1:1 des feuilles Excel (étape 1)."""
     st.set_page_config(
+        page_title="Visualisation Excel 1:1",
         layout="wide",
-        initial_sidebar_state="collapsed"
-    )
-    
-    # Style CSS
-    st.markdown("""
-    <style>
-        .stApp {
-            padding: 1rem;
-        }
-        .mode-selector {
-            margin-bottom: 1rem;
-        }
-        .file-info {
-            margin: 1rem 0;
-            padding: 1rem;
-            background-color: #f8f9fa;
-            border-radius: 0.5rem;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Titre principal
-    st.markdown("<h1 style='text-align: center;'>Visualisation de Fichiers Excel</h1>", unsafe_allow_html=True)
-    
-    # Sélecteur de mode d'affichage
-    mode = st.radio(
-        "Sélectionnez le mode d'affichage :",
-        ["Vue fidèle (recommandé)", "Vue rapide"],
-        horizontal=True,
-        key="mode_affichage",
-        index=0,
-        help="Choisissez entre une vue fidèle à l'original ou une vue optimisée"
+        initial_sidebar_state="collapsed",
     )
 
-    # Zone de dépôt de fichier
-    with st.container():
-        fichier = st.file_uploader(
-            "Glissez-déposez votre fichier Excel ou cliquez pour parcourir",
-            type=["xlsx", "xls"],
-            key="file_uploader",
-            label_visibility="hidden"
-        )
+    st.markdown("<h1 style='text-align: center;'>Visualisation fidèle des fichiers Excel</h1>", unsafe_allow_html=True)
+
+    # Zone de dépôt de fichier (aucune logique métier)
+    fichier = st.file_uploader(
+        "Glissez-déposez votre fichier Excel ou cliquez pour parcourir",
+        type=["xlsx", "xls"],
+        key="file_uploader",
+        label_visibility="hidden",
+    )
 
     if fichier is not None:
         try:
-            with st.spinner("Vérification de l'intégrité du fichier..."):
-                if verifier_fidelite_excel(fichier):
-                    st.success("✓ Fichier Excel vérifié avec succès")
-                    
-                    # Lecture du fichier
-                    df = lire_excel_brut(fichier)
-                    fichier.seek(0)
-                    
-                    # Affichage des métadonnées
-                    with st.expander("📋 Informations du fichier", expanded=True):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Fichier", fichier.name)
-                            st.metric("Feuille", "Feuille 1")  # Peut être dynamisé si nécessaire
-                        with col2:
-                            st.metric("Lignes", len(df))
-                            st.metric("Colonnes", len(df.columns))
-                    
-                    # Affichage selon le mode sélectionné
-                    st.markdown("### Aperçu des données")
-                    if mode == "Vue fidèle (recommandé)":
-                        afficher_excel_brut(df)
-                    else:
-                        st.dataframe(
-                            df,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=500
-                        )
-                    
-                    # Options d'export
-                    with st.expander("💾 Options d'export"):
-                        st.download_button(
-                            label="Télécharger au format CSV",
-                            data=df.to_csv(index=False).encode('utf-8-sig'),
-                            file_name=f"{fichier.name.split('.')[0]}_export.csv",
-                            mime="text/csv"
-                        )
-                        
+            # Lire une seule fois en mémoire pour réutiliser le contenu sans le modifier
+            file_bytes = fichier.getvalue()
+            xls = pd.ExcelFile(io.BytesIO(file_bytes))
+            sheets = xls.sheet_names
+
+            # Sélecteur de feuille exact (aucune détection automatique de headers)
+            feuille = st.selectbox(
+                "Choisissez la feuille à afficher (mirroir 1:1, aucune transformation) :",
+                sheets,
+                key="sheet_selector",
+            )
+
+            if feuille:
+                # Vérification d'intégrité strictement sur la feuille sélectionnée
+                with st.spinner("Vérification de l'intégrité de la feuille..."):
+                    verifier_fidelite_excel(io.BytesIO(file_bytes), feuille=feuille)
+                st.success("✓ Feuille vérifiée : affichage 1:1 (aucune transformation)")
+
+                # Lecture brute sans aucune modification
+                df = lire_excel_brut(io.BytesIO(file_bytes), feuille=feuille)
+
+                # Métadonnées minimales (pas de renommage, pas de suppression)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Fichier", fichier.name)
+                    st.metric("Feuille", feuille)
+                with col2:
+                    st.metric("Lignes", len(df))
+                    st.metric("Colonnes", len(df.columns))
+
+                st.markdown("### Aperçu fidèle de la feuille Excel")
+                afficher_excel_brut(df)
+
         except Exception as e:
             st.error(f"❌ Erreur lors du traitement du fichier : {str(e)}")
-            st.error("Veuillez vérifier que le fichier est un document Excel valide et non corrompu.")
-            st.error(f"❌ Une erreur est survenue : {str(e)}")
+            st.error("Étape 1 échouée : l'affichage doit rester 1:1 sans aucune transformation.")
 
 # Point d'entrée principal
 if __name__ == "__main__":
     afficher_interface_principale()
+    # Étape 1 uniquement : arrêt pour éviter d'exécuter les sections de codage plus bas
+    st.stop()
 
 # CSS design amélioré — lisibilité et boutons
 st.markdown("""
